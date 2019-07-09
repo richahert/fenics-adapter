@@ -67,7 +67,13 @@ class CustomExpression(UserExpression):
             elif self.isVectorValues():
                 self._f.append(Rbf(self._coords_x, self._coords_y, self._vals[:,0].flatten())) # extract dim_no element of each vector
                 self._f.append(Rbf(self._coords_x, self._coords_y, self._vals[:,1].flatten())) # extract dim_no element of each vector
-
+        elif self._dimension == 3:
+            if self.isScalarValues():
+                self._f.append(Rbf(self._coords_x, self._coords_y, self._vals.flatten()))
+            elif self.isVectorValues():
+                self._f.append(Rbf(self._coords_x, self._coords_y, self._coords_z, self._vals[:,0].flatten())) # extract dim_no element of each vector
+                self._f.append(Rbf(self._coords_x, self._coords_y, self._coords_z, self._vals[:,1].flatten())) # extract dim_no element of each vector
+                self._f.append(Rbf(self._coords_x, self._coords_y, self._coords_z, self._vals[:,2].flatten()))
             else: # TODO: this is already checked in isScalarValues()!
                 raise Exception("Dimension of the function is 0 or negative!")
                 
@@ -105,8 +111,12 @@ class CustomExpression(UserExpression):
         Overrides UserExpression.eval(). Called by Expression(x_coord). handles
         scalar- and vector-valued functions evaluation.
         """
-        for i in range(self._vals.ndim):
-            value[i] = self._f[i](x[0],x[1])
+        if self._dimension == 2:
+            for i in range(self._vals.ndim):
+                value[i] = self._f[i](x[0],x[1])
+        elif self._dimension == 3: 
+            for i in range(self._vals.ndim):
+                value[i] = self._f[i](x[0], x[1], x[2])
 
     def isScalarValues(self):
         """ Determines if function being interpolated is scalar-valued based on
@@ -146,6 +156,7 @@ class Adapter:
         self._interface = precice.Interface(self._solver_name, 0, 1)
         self._interface.configure(self._config.get_config_file_name())
         self._dimensions = self._interface.get_dimensions()
+        self._normalization_factor = self._config.get_normalization_factor()
 
         self._coupling_subdomain = None # initialized later
         self._mesh_fenics = None # initialized later
@@ -180,7 +191,7 @@ class Adapter:
 
         #function space
         self._function_space = None
-        self.dss = None #intgration domain for evaluation an integral over the domain
+        
         
     def convert_fenics_to_precice(self, data, mesh, subdomain):
         """Converts FEniCS data of type dolfin.Function into
@@ -191,9 +202,15 @@ class Adapter:
         :return: array of FEniCS function values at each point on the boundary
         """
         if type(data) is dolfin.Function:
-            x_all, y_all = self.extract_coupling_boundary_coordinates()
+            if self._fenics_dimensions == 2:
+                x_all, y_all = self.extract_coupling_boundary_coordinates()
+                return np.array([data(x, y) for x, y in zip(x_all, y_all)])
+
+            if self._fenics_dimensions == 3:
+                x_all, y_all, z_all = self.extract_coupling_boundary_coordinates()
+                return np.array([data(x, y, z) for x, y, z in zip(x_all, y_all, z_all)])
+
             #TODO: Append line of zeros for 2D-3D FSI-Coupling
-            return np.array([data(x, y) for x, y in zip(x_all, y_all)])
 #            if self._fenics_dimensions==2 and self._dimensions==3: #Quasi 2D fenics
 #                assert(precice_data.shape[1] == 2)
 #                #insert zeros for y component
@@ -201,6 +218,7 @@ class Adapter:
 #                assert(precice_data.shape[1] == 3)
 #            return precice_data.ravel()
             #ich glaube das ist doch quatsch das hier zu machen, besser in read_block_data und write_block_data
+        
         else:
             raise Exception("Cannot handle data type %s" % type(data))
             
@@ -254,11 +272,11 @@ class Adapter:
                 self._interface.read_block_vector_data(self._read_data_id, self._n_vertices,
                                                    self._vertex_ids, precice_data)
                 
-                precice_read_data = np.reshape(precice_data,(self._n_vertices, self._dimensions), 'C')
+                precice_read_data =  np.reshape(precice_data,(self._n_vertices, self._dimensions), 'C')
                 
             
-                self._read_data[:,0] = precice_read_data[:,0]
-                self._read_data[:,1] = precice_read_data[:,2] # y is the dead direction so it is left out
+                self._read_data[:,0] = self._normalization_factor * precice_read_data[:,0]
+                self._read_data[:,1] =self._normalization_factor * precice_read_data[:,2] # y is the dead direction so it is left out
             else: 
                 raise Exception("Dimensions don't match!")
             
@@ -291,10 +309,13 @@ class Adapter:
                 if self._dimensions == 2:
                     vertices_y.append(v.x(1))
                 
-                elif self._dimensions == 3:
+                elif self._dimensions == 3 and self._fenics_dimensions==2: 
                     # todo this has to be fixed for "proper" 3D coupling. Currently this is a workaround for the coupling of 2D fenics with pseudo 3D openfoam
                     vertices_z.append(v.x(1))
                     vertices_y.append(0)
+                elif self._dimensions == 3:
+                    vertices_y.append(v.x(1))
+                    vertices_z.append(v.x(2))
 
         if self._dimensions == 2:
             return np.stack([vertices_x, vertices_y]), n
@@ -329,12 +350,19 @@ class Adapter:
 
     def create_coupling_boundary_condition(self):
         """Creates the coupling boundary conditions using CustomExpression."""
-        x_vert, y_vert = self.extract_coupling_boundary_coordinates()
+        if self._fenics_dimensions==2:
+            x_vert, y_vert = self.extract_coupling_boundary_coordinates()
+        elif self._fenics_dimensions == 3:
+            x_vert, y_vert, z_vert = self.extract_coupling_boundary_coordinates()
         try:  # works with dolfin 1.6.0
             self._coupling_bc_expression = CustomExpression(element=self._function_space.ufl_element()) # elemnt information must be provided, else DOLFIN assumes scalar function
         except (TypeError, KeyError):  # works with dolfin 2017.2.0
             self._coupling_bc_expression = CustomExpression(element=self._function_space.ufl_element(),degree=0)
-        self._coupling_bc_expression.set_boundary_data(self._read_data, x_vert, y_vert)
+        
+        if self._fenics_dimensions == 2:
+            self._coupling_bc_expression.set_boundary_data(self._read_data, x_vert, y_vert)
+        elif self._fenics_dimensions == 3:
+            self._coupling_bc_expression.set_boundary_data(self._read_data, x_vert, y_vert, z_vert)
 
     def create_coupling_dirichlet_boundary_condition(self, function_space):
         """Creates the coupling Dirichlet boundary conditions using
@@ -346,7 +374,7 @@ class Adapter:
         self.create_coupling_boundary_condition()
         return dolfin.DirichletBC(self._function_space, self._coupling_bc_expression, self._coupling_subdomain)
 
-    def create_coupling_neumann_boundary_condition(self, test_functions, boundary_marker=None):
+    def create_coupling_neumann_boundary_condition(self, test_functions):
         """Creates the coupling Neumann boundary conditions using
         create_coupling_boundary_condition() method.
 
@@ -356,12 +384,8 @@ class Adapter:
         """
         self._function_space = test_functions.function_space()
         self.create_coupling_boundary_condition()
-        if not boundary_marker: #there is only 1 Neumann-BC which is at the coupling boundary -> integration over whole boundary
-            
-            return dot(test_functions, self._coupling_bc_expression) * dolfin.ds  # this term has to be added to weak form to add a Neumann BC (see e.g. p. 83ff Langtangen, Hans Petter, and Anders Logg. "Solving PDEs in Python The FEniCS Tutorial Volume I." (2016).)
-        else: #For multiple Neumann BCs integration should only be performed over the respective domain. TODO: fix the problem here
-            raise Exception("Boundary markers are not implemented yet")
-            return dot(self._coupling_bc_expression, test_functions) * self.dss(boundary_marker)
+        return dot(test_functions, self._coupling_bc_expression) * dolfin.ds  # this term has to be added to weak form to add a Neumann BC (see e.g. p. 83ff Langtangen, Hans Petter, and Anders Logg. "Solving PDEs in Python The FEniCS Tutorial Volume I." (2016).)
+
 
     def advance(self, write_function, u_np1, u_n, t, dt, n):
         """Calls preCICE advance function using precice and manages checkpointing.
@@ -381,7 +405,11 @@ class Adapter:
         """
 
         # sample write data at interface
-        x_vert, y_vert = self.extract_coupling_boundary_coordinates()
+        if self._fenics_dimensions == 2:
+            x_vert, y_vert = self.extract_coupling_boundary_coordinates()
+        elif self._fenics_dimensions == 3:
+            x_vert, y_vert, z_vert = self.extract_coupling_boundary_coordinates()
+
         self._write_data = self.convert_fenics_to_precice(write_function, self._mesh_fenics, self._coupling_subdomain)
 
         # communication
@@ -409,7 +437,11 @@ class Adapter:
 #            self._interface.read_block_vector_data(self._read_data_id, self._n_vertices, self._vertex_ids, self._read_data.ravel())
 
         # update boundary condition with read data
-        self._coupling_bc_expression.update_boundary_data(self._read_data, x_vert, y_vert)
+        if self._fenics_dimensions == 2:
+            self._coupling_bc_expression.update_boundary_data(self._read_data, x_vert, y_vert)
+        elif self._fenics_dimensions == 3:
+            self._coupling_bc_expression.update_boundary_data(self._read_data, x_vert, y_vert, z_vert)
+
         #print("Evaluate Force Field at different pionts. Should be [1 0] for Dummies")
         #print(self._coupling_bc_expression((0,1)))
 
@@ -439,7 +471,7 @@ class Adapter:
         return t, n, precice_step_complete, max_dt
 
     def initialize(self, coupling_subdomain, mesh, read_field, write_field, 
-                   u_n, dimension=2, t=0, n=0, coupling_marker=0):
+                   u_n, dimension=2, t=0, n=0):
         """Initializes remaining attributes. Called once, from the solver.
 
         :param read_field: function applied on the read field
@@ -478,7 +510,6 @@ class Adapter:
             self._interface.fulfilled_action(precice.action_write_iteration_checkpoint())
             
         #create an integration domain for the coupled boundary
-        self.dss=Measure('ds', domain=mesh, subdomain_data=coupling_marker)
         print("Initialization successful")
 
         return self._precice_tau
@@ -500,13 +531,15 @@ class Adapter:
         vertices, _ = self.extract_coupling_boundary_vertices()
         vertices_x = vertices[0, :]
         vertices_y = vertices[1, :]
-        if self._dimensions == 3:
+        if self._dimensions == 3 and self._fenics_dimensions == 3:
             vertices_z = vertices[2, :]
-
+            return vertices_x, vertices_y, vertices_z
         if self._dimensions == 2:
             return vertices_x, vertices_y
         elif self._dimensions == 3 and self._fenics_dimensions==2:
             # todo this has to be fixed for "proper" 3D coupling. Currently this is a workaround for the coupling of 2D fenics with pseudo 3D openfoam
+            vertices_z = vertices[2, :]
+
             return vertices_x, vertices_z
         else:
             raise Exception("Error: These Dimensions are not supported by the adapter.")

@@ -22,6 +22,7 @@ class Config:
         self._coupling_mesh_name = None
         self._read_data_name = None
         self._write_data_name = None
+        self._normalization_factor = None
 
         self.readJSON(adapter_config_filename)
 
@@ -43,6 +44,10 @@ class Config:
         self._coupling_mesh_name = data["interface"]["coupling_mesh_name"]
         self._write_data_name = data["interface"]["write_data_name"]
         self._read_data_name = data["interface"]["read_data_name"]
+        try:
+            self._normalization_factor = data["interface"]["normalization_factor"]
+        except:
+            self._normalization_factor = 1.0
 
         read_file.close()
 
@@ -60,3 +65,6 @@ class Config:
 
     def get_write_data_name(self):
         return self._write_data_name
+    
+    def get_normalization_factor(self):
+        return self._normalization_factor
